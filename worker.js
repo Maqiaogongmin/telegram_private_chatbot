@@ -24,6 +24,14 @@ const CONFIG = {
     THREAD_HEALTH_TTL_MS: 60000
 };
 
+
+const AI_CONFIG = {
+    MODE: "block",
+    THRESHOLD: 0.75,
+    MAX_TEXT: 2000,
+    ADMIN_NOTE_PREFIX: "🤖 AI风险提示"
+};
+
 // 线程健康检查缓存，减少频繁探测请求
 const threadHealthCache = new Map();
 // 同一实例内的并发保护：避免同一用户短时间内重复创建话题
@@ -370,6 +378,92 @@ async function checkRateLimit(userId, env, action = 'message', limit = 20, windo
     return { allowed: true, remaining: limit - count - 1 };
 }
 
+
+function shouldReviewByRule(msg) {
+    const text = ((msg.text || msg.caption || "") + "").toLowerCase();
+    if (!text.trim()) return false;
+
+    const keywords = [
+        "兼职", "返利", "带单", "稳赚", "空投", "加群", "客服",
+        "推广", "合作推广", "投资", "赚钱", "副业", "刷单",
+        "博彩", "代付", "解冻", "流水", "trx", "usdt",
+        "约炮", "招嫖", "上门", "同城约", "av电影", "成人视频",
+        "裸聊", "自拍偷拍", "自拍偷拍", "色情网", "黄网站", "av",
+        "成人", "性服务", "包夜", "援交", "私密视频", "激情视频"
+    ];
+
+    if (text.includes("http://") || text.includes("https://") || text.includes("t.me/")) {
+        return true;
+    }
+
+    for (const kw of keywords) {
+        if (text.includes(kw)) return true;
+    }
+
+    if (text.length < 80 && (text.includes("http") || text.includes("t.me"))) {
+        return true;
+    }
+
+    return false;
+}
+
+async function aiReviewMessage(env, text) {
+    if (!env.AI_API_KEY || !env.AI_BASE_URL || !env.AI_MODEL) {
+        return { enabled: false, risk: 0, label: "disabled", reason: "AI not configured" };
+    }
+
+    const content = (text || "").slice(0, AI_CONFIG.MAX_TEXT).trim();
+    if (!content) {
+        return { enabled: true, risk: 0, label: "empty", reason: "no text" };
+    }
+
+    const prompt = [
+        "你是 Telegram 私聊风控分类器。",
+        "请判断以下消息是否疑似广告、诈骗、引流、钓鱼、垃圾骚扰、色情推广、招嫖或成人内容营销。",
+        "如果内容涉及成人服务、性暗示交易、色情站点导流、裸聊、约炮、招嫖、成人群推广，应判为高风险。",
+        "只返回 JSON，不要返回任何解释性文字。",
+        "输出格式：{\"risk\":0到1小数,\"label\":\"normal|ad|scam|phishing|spam|porn|escort|suspicious\",\"reason\":\"一句中文理由\"}",
+        "消息内容如下：",
+        content
+    ].join("\n\n");
+
+    const resp = await fetch(`${env.AI_BASE_URL}/chat/completions`, {
+        method: "POST",
+        headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${env.AI_API_KEY}`
+        },
+        body: JSON.stringify({
+            model: env.AI_MODEL,
+            temperature: 0,
+            messages: [
+                { role: "system", content: "你是严格输出 JSON 的中文风控分类器。" },
+                { role: "user", content: prompt }
+            ],
+            response_format: { type: "json_object" }
+        })
+    });
+
+    if (!resp.ok) {
+        return { enabled: true, risk: 0, label: "error", reason: `AI HTTP ${resp.status}` };
+    }
+
+    const data = await resp.json();
+    const raw = data?.choices?.[0]?.message?.content || "{}";
+
+    try {
+        const parsed = JSON.parse(raw);
+        return {
+            enabled: true,
+            risk: Number(parsed.risk || 0),
+            label: parsed.label || "unknown",
+            reason: parsed.reason || "无说明"
+        };
+    } catch (e) {
+        return { enabled: true, risk: 0, label: "parse_error", reason: "AI 返回无法解析" };
+    }
+}
+
 export default {
   async fetch(request, env, ctx) {
     // 环境自检
@@ -489,6 +583,26 @@ async function handlePrivateMessage(msg, env, ctx) {
     const pendingMsgId = isStart ? null : msg.message_id;
     await sendVerificationChallenge(userId, env, pendingMsgId);
     return;
+  }
+
+  const textForReview = msg.text || msg.caption || "";
+
+  if (shouldReviewByRule(msg)) {
+      const review = await aiReviewMessage(env, textForReview);
+      const threshold = Number(env.AI_THRESHOLD || AI_CONFIG.THRESHOLD);
+      const mode = env.AI_MODE || AI_CONFIG.MODE;
+
+      if (review.enabled && review.risk >= threshold) {
+          if (mode === "block") {
+              await tgCall(env, "sendMessage", {
+                  chat_id: userId,
+                  text: "⚠️ 消息未通过安全检查，请调整内容后重试。"
+              });
+              return;
+          }
+
+          msg.__aiReview = review;
+      }
   }
 
   await forwardToTopic(msg, userId, key, env, ctx);
@@ -697,6 +811,17 @@ async function forwardToTopic(msg, userId, key, env, ctx) {
             from_chat_id: userId,
             message_id: msg.message_id,
             message_thread_id: rec.thread_id
+        });
+    }
+
+    if (msg.__aiReview) {
+        await tgCall(env, "sendMessage", {
+            chat_id: env.SUPERGROUP_ID,
+            message_thread_id: rec.thread_id,
+            text: `${AI_CONFIG.ADMIN_NOTE_PREFIX}
+风险值: ${msg.__aiReview.risk}
+类型: ${msg.__aiReview.label}
+原因: ${msg.__aiReview.reason}`
         });
     }
 }
